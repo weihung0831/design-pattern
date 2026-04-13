@@ -10,6 +10,7 @@
 |------|------|
 | [backend-design-patterns.md](./backend-design-patterns.md) | 後端設計原則、設計模式與命名規範（PHP / Laravel） |
 | [frontend(blade)-design-patterns.md](./frontend(blade)-design-patterns.md) | 前端設計原則、設計模式與命名規範（Blade / Alpine.js） |
+| [testing-design-patterns.md](./testing-design-patterns.md) | 測試策略、測試替身與命名規範（PHPUnit / Dusk） |
 
 ## 架構
 
@@ -59,6 +60,22 @@ Controller → ServiceInterface → Service → RepositoryInterface → Reposito
 | Observer | 跨元件通訊（CustomEvent） |
 | State Machine | 管理互斥的 UI 狀態 |
 | Debounce / Throttle | 高頻事件控制 |
+
+### 測試策略
+
+| 層級 | 測試類型 | 替身策略 |
+|------|---------|---------|
+| Controller | Feature Test（真實 HTTP） | 真實 DB |
+| FormRequest | Unit Test | 無 |
+| Service | Unit Test | Mock RepositoryInterface |
+| Repository | Unit Test（Integration） | 真實 DB |
+| Model | Unit Test | 真實 DB |
+| Policy | Unit Test | Factory 建立使用者 |
+| Adapter / Strategy / Null Object | Unit Test | Mock Interface（若有外部依賴） |
+| Blade 元件 | Feature Test | 真實 render |
+| Alpine 元件 | Browser Test（Dusk） | 真實瀏覽器 |
+
+核心測試模式：測試金字塔、Arrange-Act-Assert、測試隔離、測試替身（Mock / Stub / Fake / Spy）、Model Factory 狀態變體。
 
 ### 命名規範
 

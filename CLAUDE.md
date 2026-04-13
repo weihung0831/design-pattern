@@ -58,6 +58,20 @@ Controller → ServiceInterface → Service → RepositoryInterface → Reposito
 - 多互斥 UI 狀態 → **State Machine**（單一字串變數，非多個 boolean）
 - 高頻事件 → **Debounce / Throttle**
 
+### 測試分層策略
+
+| 層級 | 測試類型 | 替身策略 |
+|------|---------|---------|
+| Controller | Feature Test（真實 HTTP） | 真實 DB |
+| FormRequest | Unit Test | 無 |
+| Service | Unit Test | Mock RepositoryInterface |
+| Repository | Unit Test（Integration） | 真實 DB |
+| Model | Unit Test | 真實 DB |
+| Policy | Unit Test | Factory 建立使用者 |
+| Adapter / Strategy / Null Object | Unit Test | Mock Interface（若有外部依賴） |
+| Blade 元件 | Feature Test | 真實 render |
+| Alpine 元件 | Browser Test（Dusk） | 真實瀏覽器 |
+
 ## 命名規範摘要
 
 ### PHP
@@ -94,3 +108,6 @@ Controller → ServiceInterface → Service → RepositoryInterface → Reposito
 - 衍生狀態用 getter / computed 計算，不另存變數手動同步
 - Adapter 只做轉換，不加業務邏輯
 - Null Object 不可拋例外或寫 log 警告
+- Mock 對象必須是 Interface，不 Mock 具體 class 或 Model
+- 測試驗證行為結果，不驗證內部實作（方法呼叫次數）
+- 每個測試獨立運行，不依賴其他測試的狀態或執行順序

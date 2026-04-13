@@ -10,6 +10,7 @@ Coding standards and design pattern guidelines for Laravel (PHP) backend + Blade
 |----------|-------|
 | [backend-design-patterns.md](./backend-design-patterns.md) | Backend principles, patterns & naming (PHP / Laravel) |
 | [frontend(blade)-design-patterns.md](./frontend(blade)-design-patterns.md) | Frontend principles, patterns & naming (Blade / Alpine.js) |
+| [testing-design-patterns.md](./testing-design-patterns.md) | Testing strategy, test doubles & naming (PHPUnit / Dusk) |
 
 ## Architecture
 
@@ -59,6 +60,22 @@ Controller → ServiceInterface → Service → RepositoryInterface → Reposito
 | Observer | Cross-component communication via CustomEvent |
 | State Machine | Mutually exclusive UI states |
 | Debounce / Throttle | High-frequency event control |
+
+### Testing Strategy
+
+| Layer | Test Type | Double Strategy |
+|-------|-----------|----------------|
+| Controller | Feature Test (real HTTP) | Real DB |
+| FormRequest | Unit Test | None |
+| Service | Unit Test | Mock RepositoryInterface |
+| Repository | Unit Test (Integration) | Real DB |
+| Model | Unit Test | Real DB |
+| Policy | Unit Test | Factory-created users |
+| Adapter / Strategy / Null Object | Unit Test | Mock Interface (if external deps) |
+| Blade components | Feature Test | Real render |
+| Alpine components | Browser Test (Dusk) | Real browser |
+
+Core testing patterns: Test Pyramid, Arrange-Act-Assert, Test Isolation, Test Doubles (Mock / Stub / Fake / Spy), Model Factory states.
 
 ### Naming Conventions
 
