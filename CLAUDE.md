@@ -12,8 +12,9 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 - `backend-design-patterns.md` — 後端規範（PHP / Laravel）
 - `frontend(blade)-design-patterns.md` — 前端規範（Blade / Alpine.js）
+- `testing-design-patterns.md` — 測試規範（各層測試策略、測試替身、命名規範）
 
-兩份文件互相引用，後端文件的命名通用原則同時適用於前端。
+三份文件互相引用，後端文件的命名通用原則同時適用於前端與測試。
 
 ## 核心架構約束
 
