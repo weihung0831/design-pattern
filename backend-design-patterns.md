@@ -785,11 +785,421 @@ class OrderService implements OrderServiceInterface
 
 ---
 
-## 三、命名規範
+## 三、架構分層規範
+
+> 本章節規範 Pragmatic Clean Architecture 在實務上的落地規則：分層之間如何互動、不變條件如何維護、程式碼如何組織。
+
+### 3.1 依賴規則
+
+**規則：依賴方向只能由外往內。反向依賴一律禁止。**
+
+```
+Presentation (Controller)
+    │
+    ▼ 依賴 Interface
+Application (Service)
+    │
+    ▼ 依賴 Interface
+Infrastructure (Repository / Model / External API)
+```
+
+#### 你必須
+
+- Controller 只引用 `ServiceInterface`，不引用 Service 實作、不引用 Repository、不引用 Model
+- Service 只引用 `RepositoryInterface` 與其他 `ServiceInterface`，不引用 Controller、Request、Response
+- Repository 是唯一可以直接操作 Eloquent Model 的地方
+- 所有跨層呼叫都透過 Interface
+
+#### 你不可以
+
+- 在 Repository 中引用 Service（反向依賴）
+- 在 Service 中建構 Request / Response 物件、讀取 `$_GET` / `request()`（Infrastructure 滲透）
+- 在 Model 中寫業務流程或呼叫 Service
+- 繞過 Service，讓 Controller 直接操作 Repository
+
+---
+
+### 3.2 Transaction 邊界
+
+**規則：Transaction 只能在 Service 層開啟與結束。**
+
+#### 你必須
+
+- Service 方法有多筆寫入時用 `DB::transaction(...)` 包起來
+- 一個 Service method = 一個 transaction 邊界
+- 外部 API 呼叫、寄信、推事件到外部系統，放在 transaction commit 之後
+
+#### 你不可以
+
+- 在 Controller 開 transaction
+- 在 Repository 開 transaction
+- 在 transaction 中呼叫外部 API、寄信、發送 Webhook
+
+#### 正確 vs 錯誤
+
+```php
+// 錯誤：Controller 開 transaction
+class OrderController
+{
+    public function store(StoreOrderRequest $request): JsonResponse
+    {
+        return DB::transaction(function () use ($request) {
+            $order = $this->orderService->create($request->validated());
+            return response()->json($order);
+        });
+    }
+}
+
+// 錯誤：transaction 中呼叫外部 API——DB 成功但外部失敗 = 狀態不一致
+public function complete(int $id): Order
+{
+    return DB::transaction(function () use ($id) {
+        $order = $this->orderRepository->update(...);
+        $this->paymentGateway->capture($order->id);
+        Mail::to($order->user)->send(new OrderCompleted($order));
+        return $order;
+    });
+}
+
+// 正確：Service 管 transaction，外部副作用在 commit 之後
+public function complete(int $id): Order
+{
+    $order = DB::transaction(function () use ($id) {
+        $order = $this->orderRepository->find($id);
+        return $this->orderRepository->update($order, [
+            'status' => 'completed',
+            'completed_at' => now(),
+        ]);
+    });
+
+    event(new OrderCompleted($order)); // Listener 負責寄信、通知外部系統
+
+    return $order;
+}
+```
+
+---
+
+### 3.3 錯誤處理策略
+
+**規則：每一層只處理自己該處理的錯誤，其餘往上拋。**
+
+#### 各層的錯誤責任
+
+| 層級 | 處理的錯誤 | 拋出的例外 |
+|------|-----------|-----------|
+| Repository | DB 層例外轉換（可選） | 不拋業務例外 |
+| Service | 業務規則違反、資源不存在、權限不足 | 自訂業務 Exception |
+| Controller | 捕捉業務 Exception，轉為 HTTP 回應 | 不拋（最後一關） |
+| Exception Handler | 未捕捉的例外、500 錯誤 | — |
+
+#### 你必須
+
+- 業務錯誤定義專屬 Exception class（`OrderNotFoundException`、`InsufficientStockException`）
+- Service 直接拋出業務 Exception，不用 `null` / `false` 表達錯誤
+- Controller 的 try/catch 只捕捉具體的業務 Exception
+- 不可預期的錯誤交給 `app/Exceptions/Handler.php` 處理
+
+#### 你不可以
+
+- 在 Service 捕捉業務 Exception 又吞掉（只寫 log 不往上拋）
+- 在 Controller 用 `catch (\Exception $e)` 捕捉所有例外
+- 用 Exception 控制正常業務流程
+
+#### 正確 vs 錯誤
+
+```php
+// 錯誤：用 null 表達錯誤，呼叫者不知道失敗原因
+public function cancel(int $id): ?Order
+{
+    $order = $this->orderRepository->find($id);
+    if (! $order || $order->status !== 'pending') {
+        return null; // 是找不到？還是狀態不對？呼叫者無法分辨
+    }
+    return $this->orderRepository->update($order, ['status' => 'cancelled']);
+}
+
+// 正確：業務 Exception 表達具體錯誤
+public function cancel(int $id): Order
+{
+    $order = $this->orderRepository->find($id)
+        ?? throw new OrderNotFoundException($id);
+
+    if ($order->status !== 'pending') {
+        throw new OrderCannotBeCancelledException($order);
+    }
+
+    return $this->orderRepository->update($order, ['status' => 'cancelled']);
+}
+
+// Controller 將業務 Exception 轉為 HTTP 回應
+public function cancel(int $id): JsonResponse
+{
+    try {
+        $order = $this->orderService->cancel($id);
+        return response()->json(['data' => new OrderResource($order)]);
+    } catch (OrderNotFoundException) {
+        return response()->json(['message' => '訂單不存在'], 404);
+    } catch (OrderCannotBeCancelledException $e) {
+        return response()->json(['message' => $e->getMessage()], 422);
+    }
+}
+```
+
+---
+
+### 3.4 跨 Service 協作規則
+
+**規則：Service 之間的依賴透過 Interface 注入，不透過全域取得。**
+
+#### 你必須
+
+- Service A 需要呼叫 Service B 時，建構子注入 `ServiceBInterface`
+- Service 之間只呼叫對方 Interface 上定義的 public method
+- 出現循環依賴時，代表職責劃分錯誤——抽出第三個 Service、或用 Event 解耦
+
+#### 你不可以
+
+- 在 Service 中用 `app(...)` 或 `resolve(...)` 取得其他 Service
+- 在 Service 中透過 Facade 呼叫其他 Service 的靜態方法
+- 在兩個 Service 之間建立循環依賴
+
+#### 正確 vs 錯誤
+
+```php
+// 錯誤：用 app() 隱藏依賴，從建構子看不出來它依賴哪些東西
+class OrderService implements OrderServiceInterface
+{
+    public function complete(int $id): Order
+    {
+        $order = $this->orderRepository->find($id);
+        app(InventoryServiceInterface::class)->deduct($order);
+        return $order;
+    }
+}
+
+// 正確：建構子注入 Interface，依賴一目了然，也好測試
+class OrderService implements OrderServiceInterface
+{
+    public function __construct(
+        private OrderRepositoryInterface $orderRepository,
+        private InventoryServiceInterface $inventoryService,
+    ) {}
+
+    public function complete(int $id): Order
+    {
+        $order = $this->orderRepository->find($id);
+        $this->inventoryService->deduct($order);
+        return $order;
+    }
+}
+```
+
+#### 循環依賴的解法
+
+若 `OrderService` 依賴 `InventoryService`、`InventoryService` 又要呼叫 `OrderService`：
+
+1. **抽出第三個 Service**：把共用邏輯搬到 `OrderInventoryCoordinator`，原本兩個 Service 都依賴它
+2. **用 Event 解耦**：Service A 發事件，Service B 用 Listener 處理，兩者不直接相依
+3. **重新檢視職責**：循環依賴通常是職責劃分錯誤，改正職責比繞開循環更根本
+
+---
+
+### 3.5 Eloquent Model 的跨層使用
+
+**規則：Eloquent Model 可跨層傳遞，但每一層對它的使用方式不同。**
+
+Pragmatic Clean Architecture 不要求 Eloquent Model 映射成純 Domain Entity——Model 可以直接在各層之間流動，但必須遵守以下邊界：
+
+#### 各層使用 Model 的方式
+
+| 層級 | 可以 | 不可以 |
+|------|------|--------|
+| Model | 關聯、scope、accessor、cast | 業務流程、呼叫 Service |
+| Repository | CRUD、查詢（`where`、`with`、`join`） | 業務判斷 |
+| Service | 接收/回傳 Model、讀取屬性、呼叫 accessor | 直接 `Order::where(...)`（必須透過 Repository） |
+| Controller | 接收 Service 回傳的 Model、轉成 Resource | 直接查詢、繞過 Service 直接修改 |
+| API Resource / View | 讀取屬性、格式化輸出 | 觸發儲存、改動 Model |
+
+#### 你必須
+
+- Controller 對外回傳資料時用 `JsonResource` 包裝，**不直接 `return $model`**
+- 敏感欄位（password、token）在 Model 的 `$hidden` 或 Resource 的 `toArray()` 過濾
+- Service 回傳 Model 後若需要最新狀態，呼叫 `refresh()` 或請 Repository 重新查詢
+
+#### 你不可以
+
+- Controller 或 Blade 中呼叫 `Order::where(...)` 繞過 Repository
+- Service 中建構 `new Order()` 或呼叫 `Order::create(...)`（走 Repository）
+- 對外 API 直接回傳 Eloquent Model（欄位會整包曝光）
+
+#### 正確 vs 錯誤
+
+```php
+// 錯誤：直接回 Model——欄位不可控、時間格式不一致、敏感資料可能外洩
+public function show(int $id): JsonResponse
+{
+    $order = $this->orderService->find($id);
+    return response()->json($order);
+}
+
+// 正確：API Resource 包裝，欄位與格式可控
+public function show(int $id): JsonResponse
+{
+    $order = $this->orderService->find($id);
+    return response()->json(['data' => new OrderResource($order)]);
+}
+
+class OrderResource extends JsonResource
+{
+    public function toArray($request): array
+    {
+        return [
+            'id' => $this->id,
+            'serial_no' => $this->serial_no,
+            'status' => $this->status,
+            'total' => $this->total_amount,
+            'created_at' => $this->created_at?->toIso8601String(),
+        ];
+    }
+}
+```
+
+---
+
+### 3.6 DI 綁定的組織
+
+**規則：DI 綁定依模組拆分，不集中在 `AppServiceProvider`。**
+
+#### 你必須
+
+- 每個業務模組有自己的 ServiceProvider
+- 一對一的綁定用 `$bindings` 陣列集中宣告
+- 需要建構邏輯或條件的綁定寫在 `register()`
+- Null Object 綁定用 `if (! $this->app->bound(...))` 保護，允許外部覆寫
+
+#### 範例
+
+```php
+// 結構一：$bindings 陣列（簡單的一對一綁定）
+class BusinessManagementServiceProvider extends ServiceProvider
+{
+    public array $bindings = [
+        OrderServiceInterface::class       => OrderService::class,
+        OrderRepositoryInterface::class    => OrderRepository::class,
+        QuotationServiceInterface::class   => QuotationService::class,
+        QuotationRepositoryInterface::class => QuotationRepository::class,
+    ];
+}
+
+// 結構二：register() 方法（需要建構邏輯 / Null Object）
+class PaymentServiceProvider extends ServiceProvider
+{
+    public function register(): void
+    {
+        $this->app->bind(PaymentGatewayInterface::class, function ($app) {
+            return new StripeGateway(
+                config('services.stripe.key'),
+                config('services.stripe.secret'),
+            );
+        });
+
+        // Null Object 預設綁定，允許測試或特定環境覆寫
+        if (! $this->app->bound(ExternalSystemInterface::class)) {
+            $this->app->bind(ExternalSystemInterface::class, NullExternalSystem::class);
+        }
+    }
+}
+```
+
+#### 你不可以
+
+- 把所有綁定塞進 `AppServiceProvider`
+- 在 Controller、Service、Middleware 中呼叫 `app()->bind(...)`（綁定只能發生在 ServiceProvider 的 `register()`）
+- 在 ServiceProvider 的 `boot()` 做綁定（`boot()` 用來啟動服務、註冊事件，不是註冊 DI 綁定）
+
+---
+
+### 3.7 命名空間與資料夾結構
+
+**規則：資料夾結構必須反映分層，同層類別集中在同一命名空間。**
+
+#### 標準結構
+
+```
+app/
+├── Http/
+│   ├── Controllers/
+│   │   └── BusinessManagement/
+│   │       ├── OrderController.php
+│   │       └── QuotationController.php
+│   ├── Requests/
+│   │   └── BusinessManagement/
+│   │       ├── StoreOrderRequest.php
+│   │       └── UpdateOrderRequest.php
+│   └── Resources/
+│       └── BusinessManagement/
+│           └── OrderResource.php
+├── Services/
+│   └── BusinessManagement/
+│       ├── Contracts/
+│       │   ├── OrderServiceInterface.php
+│       │   └── QuotationServiceInterface.php
+│       ├── OrderService.php
+│       └── QuotationService.php
+├── Repositories/
+│   └── BusinessManagement/
+│       ├── Contracts/
+│       │   ├── OrderRepositoryInterface.php
+│       │   └── QuotationRepositoryInterface.php
+│       ├── OrderRepository.php
+│       └── QuotationRepository.php
+├── Models/
+│   ├── Order.php
+│   └── Quotation.php
+├── Exceptions/
+│   └── BusinessManagement/
+│       ├── OrderNotFoundException.php
+│       └── OrderCannotBeCancelledException.php
+└── Providers/
+    └── BusinessManagementServiceProvider.php
+```
+
+#### 你必須
+
+- Interface 與實作分開：Interface 放在 `Contracts/` 子目錄
+- 大型系統以業務模組（BusinessManagement、Crm、Inventory...）為第二層目錄
+- Model 集中在 `app/Models/`（Laravel convention）
+
+#### 你不可以
+
+- 把 Service 和 Repository 塞在同一個目錄
+- 依「技術類型」而非「業務模組」分類——錯誤：`Services/Validators/`、`Services/Calculators/`；正確：`Services/BusinessManagement/`（同一業務的相關類別會散在多處時就錯了）
+- 讓 Interface 與實作的命名空間差太遠，導致 import 時難以對照
+
+---
+
+### 3.8 分層規範速查表
+
+| 情境 | 規則 | 所在章節 |
+|------|------|---------|
+| 跨層呼叫 | 只能由外往內，透過 Interface | 3.1 |
+| 多筆寫入需要原子性 | 在 Service 層包 `DB::transaction()` | 3.2 |
+| 外部 API / 寄信 | 不在 transaction 內、commit 之後執行 | 3.2 |
+| 業務錯誤回報 | 拋出自訂 Exception，不用 null/false | 3.3 |
+| Service 互相呼叫 | 建構子注入 Interface，不用 `app()` | 3.4 |
+| 對外 API 回傳資料 | `JsonResource` 包裝，不直接回 Model | 3.5 |
+| 資料查詢 | 一律透過 Repository，不直接 `Model::where(...)` | 3.5 |
+| DI 綁定 | 依模組拆 ServiceProvider，用 `$bindings` 陣列 | 3.6 |
+| 類別放哪 | `Services/{Module}/`、`Repositories/{Module}/`、Interface 在 `Contracts/` | 3.7 |
+
+---
+
+## 四、命名規範
 
 > 命名是程式碼可讀性的基礎。好的名稱讓程式碼自解釋，壞的名稱讓所有人猜。
 
-### 3.1 通用原則
+### 4.1 通用原則
 
 #### 語意優先，長度其次
 
@@ -837,7 +1247,7 @@ $user, $manager, $button, $message, $quantity, $amount, $address, $index, $count
 
 ---
 
-### 3.2 PHP
+### 4.2 PHP
 
 #### 總覽表
 
@@ -908,7 +1318,7 @@ public function shouldSendNotification(): bool;
 
 ---
 
-### 3.3 資料庫
+### 4.3 資料庫
 
 #### 總覽表
 
@@ -933,7 +1343,7 @@ public function shouldSendNotification(): bool;
 
 ---
 
-### 3.4 路由
+### 4.4 路由
 
 #### URL 路徑
 
@@ -964,7 +1374,7 @@ Route::name('business-management.')->group(function () {
 
 ---
 
-### 3.5 檔案命名
+### 4.5 檔案命名
 
 | 類別 | 格式 | 範例 |
 |------|------|------|
@@ -980,7 +1390,7 @@ Route::name('business-management.')->group(function () {
 
 ---
 
-### 3.6 命名速查表
+### 4.6 命名速查表
 
 | 我在寫… | 格式 | 前綴/後綴規則 |
 |---------|------|--------------|
